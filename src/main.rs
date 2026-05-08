@@ -68,18 +68,48 @@ fn main() {
         }
     });
 
-    // Fault injector: cycle through nodes, isolate each for a while, then heal.
+    // Fault injector: cycle through several fault patterns so we exercise
+    // isolation, packet loss, latency, and split-brain partitions.
     spawn(move || {
-        let isolate_for = Duration::from_secs(4);
-        let healthy_for = Duration::from_secs(4);
-        sleep(healthy_for); // let the initial election settle
-        for id in peers.into_iter().cycle() {
-            info!(target: "injector", node = id, "isolate");
-            faults.isolate(id);
-            sleep(isolate_for);
-            info!(target: "injector", node = id, "heal");
-            faults.heal(id);
-            sleep(healthy_for);
+        let phase = Duration::from_secs(5);
+        sleep(phase); // let the initial election settle
+
+        loop {
+            // Phase 1: isolate one node entirely.
+            info!(target: "injector", "isolate node 1");
+            faults.isolate(1);
+            sleep(phase);
+            faults.heal(1);
+
+            // Phase 2: 30% packet loss across the whole cluster.
+            info!(target: "injector", "drop_rate 0.3");
+            faults.set_drop_rate(0.3);
+            sleep(phase);
+            faults.set_drop_rate(0.0);
+
+            // Phase 3: 50-200ms latency on every message.
+            info!(target: "injector", "delay 50..200ms");
+            faults.set_delay(50, 200);
+            sleep(phase);
+            faults.set_delay(0, 0);
+
+            // Phase 4: split into a quorum side and a minority side.
+            info!(target: "injector", "partition {{1,2}} | {{3}}");
+            faults.partition(vec![vec![1, 2], vec![3]]);
+            sleep(phase);
+            faults.clear_partition();
+
+            // Phase 5: total split, no quorum anywhere.
+            info!(target: "injector", "partition {{1}} | {{2}} | {{3}}");
+            faults.partition(vec![vec![1], vec![2], vec![3]]);
+            sleep(phase);
+            faults.clear_partition();
+
+            // Belt and braces.
+            faults.reset();
+
+            info!(target: "injector", "healthy");
+            sleep(phase);
         }
     });
 

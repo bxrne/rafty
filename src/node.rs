@@ -4,16 +4,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
+use rand::prelude::*;
 use tracing::{debug, info, info_span, warn};
 
 use crate::rpc::{Message, RPC};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeState {
-    Candidate,
     Follower,
+    PreCandidate,
+    Candidate,
     Leader,
 }
 
@@ -55,9 +57,6 @@ pub struct Node {
     election_timeout: Duration,
     votes_received: HashSet<NodeId>,
 
-    // Tiny LCG so we don't need the `rand` crate
-    rng_state: u64,
-
     // Transport seam + client surface + leader command intake
     inbox: Receiver<Message>,
     rpc: Arc<dyn RPC>,
@@ -72,10 +71,6 @@ impl Node {
         rpc: Arc<dyn RPC>,
         client_rx: Arc<Mutex<Receiver<String>>>,
     ) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.subsec_nanos() as u64)
-            .unwrap_or(0);
         let mut node = Node {
             id,
             state: NodeState::Follower,
@@ -91,7 +86,6 @@ impl Node {
             last_heard: Instant::now(),
             election_timeout: Duration::from_millis(ELECTION_TIMEOUT_MIN_MS),
             votes_received: HashSet::new(),
-            rng_state: id.wrapping_mul(2654435761).wrapping_add(nanos),
             inbox,
             rpc,
             client_rx,
@@ -100,8 +94,6 @@ impl Node {
         node
     }
 
-    // ---------- main loop ----------
-
     pub fn run(&mut self, shutdown: Arc<AtomicBool>) {
         let span = info_span!("node", id = self.id);
         let _enter = span.enter();
@@ -109,6 +101,7 @@ impl Node {
         while !shutdown.load(Ordering::Relaxed) {
             match self.state {
                 NodeState::Follower => self.tick_follower(),
+                NodeState::PreCandidate => self.tick_pre_candidate(),
                 NodeState::Candidate => self.tick_candidate(),
                 NodeState::Leader => self.tick_leader(),
             }
@@ -126,7 +119,16 @@ impl Node {
         let timeout = self.election_deadline_remaining();
         match self.inbox.recv_timeout(timeout) {
             Ok(msg) => self.handle_message(msg),
-            Err(RecvTimeoutError::Timeout) => self.start_election(),
+            Err(RecvTimeoutError::Timeout) => self.start_pre_election(),
+            Err(RecvTimeoutError::Disconnected) => {}
+        }
+    }
+
+    fn tick_pre_candidate(&mut self) {
+        let timeout = self.election_deadline_remaining();
+        match self.inbox.recv_timeout(timeout) {
+            Ok(msg) => self.handle_message(msg),
+            Err(RecvTimeoutError::Timeout) => self.start_pre_election(),
             Err(RecvTimeoutError::Disconnected) => {}
         }
     }
@@ -135,7 +137,7 @@ impl Node {
         let timeout = self.election_deadline_remaining();
         match self.inbox.recv_timeout(timeout) {
             Ok(msg) => self.handle_message(msg),
-            Err(RecvTimeoutError::Timeout) => self.start_election(),
+            Err(RecvTimeoutError::Timeout) => self.start_pre_election(),
             Err(RecvTimeoutError::Disconnected) => {}
         }
     }
@@ -222,13 +224,19 @@ impl Node {
         );
     }
 
-    // ---------- message handling ----------
-
     fn handle_message(&mut self, msg: Message) {
-        // Universal "higher term seen" rule.
-        let msg_term = msg.term();
-        if msg_term > self.current_term {
-            self.step_down(msg_term);
+        // Universal "higher term seen" rule, EXCEPT for PreVote messages —
+        // ignoring them here is the whole point of PreVote (no term bump from
+        // a returning isolated node that has been spinning elections alone).
+        let is_prevote = matches!(
+            msg,
+            Message::PreVoteRequest { .. } | Message::PreVoteResponse { .. }
+        );
+        if !is_prevote {
+            let msg_term = msg.term();
+            if msg_term > self.current_term {
+                self.step_down(msg_term);
+            }
         }
 
         match msg {
@@ -264,6 +272,65 @@ impl Node {
                 success,
                 match_index,
             } => self.handle_append_entries_response(term, from, success, match_index),
+            Message::PreVoteRequest {
+                term,
+                from,
+                last_log_index,
+                last_log_term,
+            } => self.handle_pre_vote_request(term, from, last_log_index, last_log_term),
+            Message::PreVoteResponse {
+                term,
+                from,
+                vote_granted,
+            } => self.handle_pre_vote_response(term, from, vote_granted),
+        }
+    }
+
+    fn handle_pre_vote_request(
+        &mut self,
+        proposed_term: Term,
+        from: NodeId,
+        last_log_index: u64,
+        last_log_term: Term,
+    ) {
+        let our_last_idx = self.log.len() as u64;
+        let our_last_term = self.log.last().map(|e| e.term).unwrap_or(0);
+        let log_ok = last_log_term > our_last_term
+            || (last_log_term == our_last_term && last_log_index >= our_last_idx);
+        // Only grant if we'd be willing to start our own election — i.e. we
+        // haven't heard from a leader within the minimum election window.
+        let timer_ok = self.last_heard.elapsed() >= Duration::from_millis(ELECTION_TIMEOUT_MIN_MS);
+        let grant = proposed_term > self.current_term && log_ok && timer_ok;
+
+        if !grant {
+            debug!(
+                candidate = from,
+                proposed_term, log_ok, timer_ok, "denied pre-vote"
+            );
+        }
+
+        self.rpc.send(
+            from,
+            Message::PreVoteResponse {
+                term: proposed_term, // echo, not our current_term
+                from: self.id,
+                vote_granted: grant,
+            },
+        );
+    }
+
+    fn handle_pre_vote_response(&mut self, proposed_term: Term, from: NodeId, vote_granted: bool) {
+        if self.state != NodeState::PreCandidate {
+            return;
+        }
+        // The proposed_term we sent was current_term + 1.
+        if proposed_term != self.current_term + 1 || !vote_granted {
+            return;
+        }
+        self.votes_received.insert(from);
+        if self.has_majority() {
+            // Pre-flight passed: now run a real election.
+            self.start_election();
         }
     }
 
@@ -443,7 +510,27 @@ impl Node {
         }
     }
 
-    // ---------- transitions ----------
+    fn start_pre_election(&mut self) {
+        self.state = NodeState::PreCandidate;
+        self.votes_received.clear();
+        self.votes_received.insert(self.id);
+        self.reset_election_timer();
+        let proposed_term = self.current_term + 1;
+        info!(proposed_term, "starting pre-vote");
+
+        let last_log_index = self.log.len() as u64;
+        let last_log_term = self.log.last().map(|e| e.term).unwrap_or(0);
+        self.rpc.broadcast(Message::PreVoteRequest {
+            term: proposed_term,
+            from: self.id,
+            last_log_index,
+            last_log_term,
+        });
+        // Single-node clusters: skip straight to the real election.
+        if self.has_majority() {
+            self.start_election();
+        }
+    }
 
     fn start_election(&mut self) {
         self.state = NodeState::Candidate;
@@ -543,8 +630,6 @@ impl Node {
         }
     }
 
-    // ---------- state machine ----------
-
     fn apply_log(&mut self) {
         while self.last_applied < self.commit_index {
             let idx = self.last_applied as usize;
@@ -571,11 +656,9 @@ impl Node {
         }
     }
 
-    // ---------- timers / rng ----------
-
     fn reset_election_timer(&mut self) {
         self.last_heard = Instant::now();
-        let jitter = self.next_rand() % ELECTION_TIMEOUT_JITTER_MS;
+        let jitter = rand::rng().random_range(0..ELECTION_TIMEOUT_JITTER_MS);
         self.election_timeout = Duration::from_millis(ELECTION_TIMEOUT_MIN_MS + jitter);
     }
 
@@ -583,13 +666,5 @@ impl Node {
         self.election_timeout
             .checked_sub(self.last_heard.elapsed())
             .unwrap_or(Duration::from_millis(0))
-    }
-
-    fn next_rand(&mut self) -> u64 {
-        self.rng_state = self
-            .rng_state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        self.rng_state >> 33
     }
 }

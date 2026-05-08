@@ -32,6 +32,17 @@ pub enum Message {
         // update `match_index[from]` without recomputing from prev_log_index.
         match_index: u64,
     },
+    PreVoteRequest {
+        term: Term,
+        from: NodeId,
+        last_log_index: u64,
+        last_log_term: Term,
+    },
+    PreVoteResponse {
+        term: Term,
+        from: NodeId,
+        vote_granted: bool,
+    },
 }
 
 impl Message {
@@ -41,6 +52,7 @@ impl Message {
             | Message::AppendEntries { term, .. }
             | Message::VoteResponse { term, .. }
             | Message::AppendEntriesResponse { term, .. } => *term,
+            Message::PreVoteRequest { term, .. } | Message::PreVoteResponse { term, .. } => *term,
         }
     }
 
@@ -50,6 +62,7 @@ impl Message {
             | Message::AppendEntries { from, .. }
             | Message::VoteResponse { from, .. }
             | Message::AppendEntriesResponse { from, .. } => *from,
+            Message::PreVoteRequest { from, .. } | Message::PreVoteResponse { from, .. } => *from,
         }
     }
 }
