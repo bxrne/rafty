@@ -1,6 +1,6 @@
 //! Transport layer for Raft communication between nodes
 
-use crate::node::{NodeId, Term};
+use crate::node::{LogEntry, NodeId, Term};
 
 // Message types for communication between nodes
 #[derive(Debug, Clone)]
@@ -8,11 +8,16 @@ pub enum Message {
     RequestVote {
         term: Term,
         from: NodeId,
+        last_log_index: u64,
+        last_log_term: Term,
     },
     AppendEntries {
         term: Term,
         from: NodeId,
-        entries: Vec<String>,
+        prev_log_index: u64,
+        prev_log_term: Term,
+        entries: Vec<LogEntry>,
+        leader_commit: u64,
     },
     VoteResponse {
         term: Term,
@@ -23,6 +28,9 @@ pub enum Message {
         term: Term,
         from: NodeId,
         success: bool,
+        // Highest log index now matched on the responder; lets the leader
+        // update `match_index[from]` without recomputing from prev_log_index.
+        match_index: u64,
     },
 }
 
