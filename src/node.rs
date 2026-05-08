@@ -93,8 +93,6 @@ impl Node {
         node
     }
 
-    // ---------- main loop ----------
-
     pub fn run(&mut self, shutdown: Arc<AtomicBool>) {
         while !shutdown.load(Ordering::Relaxed) {
             match self.state {
@@ -155,8 +153,6 @@ impl Node {
         }
     }
 
-    // ---------- message handling ----------
-
     fn handle_message(&mut self, msg: Message) {
         // Universal "higher term seen" rule.
         let msg_term = msg.term();
@@ -183,13 +179,23 @@ impl Node {
                     },
                 );
             }
-            Message::AppendEntries { term, from, .. } => {
+            Message::AppendEntries {
+                term,
+                from,
+                entries,
+            } => {
                 let success = term >= self.current_term;
                 if success {
                     if self.state == NodeState::Candidate {
                         self.state = NodeState::Follower;
                     }
                     self.reset_election_timer();
+                    // Skeletal log replication: append + commit + apply.
+                    for command in entries {
+                        self.log.push(LogEntry { term, command });
+                    }
+                    self.commit_index = self.log.len() as u64;
+                    self.apply_log();
                 }
                 self.rpc.send(
                     from,
@@ -212,13 +218,22 @@ impl Node {
                     }
                 }
             }
-            Message::AppendEntriesResponse { .. } => {
-                // Log replication not implemented yet.
+            Message::AppendEntriesResponse {
+                term,
+                from,
+                success,
+            } => {
+                // Log replication tracking is stubbed; surface NACKs so we'll
+                // notice them when wiring up nextIndex/matchIndex later.
+                if self.state == NodeState::Leader && term == self.current_term && !success {
+                    eprintln!(
+                        "Node {} append rejected by {} (term {})",
+                        self.id, from, term
+                    );
+                }
             }
         }
     }
-
-    // ---------- transitions ----------
 
     fn start_election(&mut self) {
         self.state = NodeState::Candidate;
@@ -253,8 +268,6 @@ impl Node {
         self.votes_received.len() > self.cluster_size / 2
     }
 
-    // ---------- timers / rng ----------
-
     fn reset_election_timer(&mut self) {
         self.last_heard = Instant::now();
         let jitter = self.next_rand() % ELECTION_TIMEOUT_JITTER_MS;
@@ -265,6 +278,19 @@ impl Node {
         self.election_timeout
             .checked_sub(self.last_heard.elapsed())
             .unwrap_or(Duration::from_millis(0))
+    }
+
+    fn apply_log(&mut self) {
+        while self.last_applied < self.commit_index {
+            let idx = self.last_applied as usize;
+            if let Some(entry) = self.log.get(idx) {
+                println!(
+                    "Node {} apply log[{}] term={} cmd={:?}",
+                    self.id, idx, entry.term, entry.command
+                );
+            }
+            self.last_applied += 1;
+        }
     }
 
     fn next_rand(&mut self) -> u64 {

@@ -35,6 +35,15 @@ impl Message {
             | Message::AppendEntriesResponse { term, .. } => *term,
         }
     }
+
+    pub fn from(&self) -> NodeId {
+        match self {
+            Message::RequestVote { from, .. }
+            | Message::AppendEntries { from, .. }
+            | Message::VoteResponse { from, .. }
+            | Message::AppendEntriesResponse { from, .. } => *from,
+        }
+    }
 }
 
 // RPC trait for sending messages between nodes.
